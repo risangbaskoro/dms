@@ -1,0 +1,26 @@
+name: Reset via GitHub Workflow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set new reset timestamp
+        run: |
+          date -u +%F > last_reset.txt
+
+      - name: Commit and push reset timestamp
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          git add last_reset.txt
+          git commit -m "Reset via GitHub Actions" || echo "Nothing to commit"
+          git push

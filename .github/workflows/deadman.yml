@@ -1,0 +1,170 @@
+name: Dead Man's Switch
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # Every day at 01:00 UTC
+    - cron: '0 6 * * *'   # Every day at 06:00 UTC
+    - cron: '0 12 * * *'  # Every day at 12:00 UTC
+  workflow_dispatch:
+
+env:
+  COMMIT_MESSAGE: "I guess this is it?"
+  TARGET_REPO: "legacy"
+  TARGET_REPO_DESCRIPTION: "This repository's content is generated in the event of a dead man's switch trigger."
+  DEADLINE_DAYS: 90
+  REMINDER_WINDOW: 30
+  EMAIL_INTERVAL_DAYS: 7
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      deadline: ${{ steps.calc.outputs.deadline }}
+      days_until_deadline: ${{ steps.calc.outputs.days_until_deadline }}
+      diff_days: ${{ steps.calc.outputs.diff_days }}
+      send_reminder: ${{ steps.calc.outputs.send_reminder }}
+      should_execute: ${{ steps.calc.outputs.should_execute }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read last reset timestamp
+        id: read_reset
+        run: |
+          if [ ! -f last_reset.txt ]; then
+            echo "last_reset.txt not found"
+            exit 1
+          fi
+          last_reset=$(cat last_reset.txt)
+          echo "last_reset=$last_reset" >> $GITHUB_OUTPUT
+
+      - name: Calculate days and flags
+        id: calc
+        run: |
+          now=$(date -u +%s)
+          reset=$(date -d "${{ steps.read_reset.outputs.last_reset }}" +%s)
+          seconds_in_day=$((60 * 60 * 24))
+          diff_days=$(( (now - reset) / seconds_in_day ))
+          echo "diff_days=$diff_days" >> $GITHUB_OUTPUT
+
+          # Calculate deadline date
+          reset_date="${{ steps.read_reset.outputs.last_reset }}"  # Last reset date from the file
+          deadline_epoch=$(date -u -d "$reset_date +${{ env.DEADLINE_DAYS }} days" +%s)
+          deadline=$(date -u -d "$reset_date +${{ env.DEADLINE_DAYS }} days" +"%A, %d %B %Y")
+          echo "Calculated deadline: $deadline"
+          echo "deadline=$deadline" >> $GITHUB_OUTPUT
+          days_until_deadline=$(( (deadline_epoch - now) / seconds_in_day ))
+          echo "days_until_deadline=$days_until_deadline" >> $GITHUB_OUTPUT
+
+          # Determine reminder flag
+          reminder_window_start=$((90 - 30))
+          if (( diff_days >= reminder_window_start )) && (( $days_until_deadline > -7 )); then
+            echo "send_reminder=true" >> $GITHUB_OUTPUT
+          else
+            echo "send_reminder=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Determine execution flag
+          if (( diff_days > 90 )) && (( $diff_days < 120 )); then
+            echo "should_execute=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_execute=false" >> $GITHUB_OUTPUT
+          fi
+
+  send-reminder:
+    needs: check
+    runs-on: ubuntu-latest
+    if: ${{ needs.check.outputs.send_reminder == 'true' }}
+    steps:
+      - name: Generate email body (email.md)
+        run: |
+          cat <<EOF > email.md
+          Hi there,
+
+          This is your daily reminder that your dead man's switch will **trigger in ${{ needs.check.outputs.days_until_deadline }} day(s)**.
+
+          Deadline: **${{ needs.check.outputs.deadline }}**
+
+          Days since reset: ${{ needs.check.outputs.diff_days }}
+
+          Please reset it by doing one of the following:
+
+          - Run the GitHub workflow using the [GitHub Reset Workflow](https://github.com/risangbaskoro/dms/actions/workflows/reset.yml).
+          - Using the [\`reset.sh\`](https://github.com/risangbaskoro/dms/blob/main/reset.sh) shell script provided in the repository.
+          - Manually update the last_reset.txt file in your GitHub repo.
+
+
+          Best regards,
+
+          Yourself
+          EOF
+
+      - name: Send reminder email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: ${{ secrets.SMTP_FROM }}
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          subject: "[Dead Man's Switch] Reminder: Reset needed"
+          html_body: file://email.md
+          convert_markdown: true
+
+  execute:
+    needs: check
+    runs-on: ubuntu-latest
+    if: ${{ needs.check.outputs.should_execute == 'true' }}
+    env:
+      GIT_USER_NAME: ${{ secrets.GIT_USER_NAME }}
+      GIT_USER_EMAIL: ${{ secrets.GIT_USER_EMAIL }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+      S3_REGION: ${{ secrets.S3_REGION }}
+      S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+      S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+    steps:
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        run: |
+          cat <<EOF > rclone.conf
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = $S3_ACCESS_KEY
+          secret_access_key = $S3_SECRET_KEY
+          endpoint = $S3_ENDPOINT
+          region = $S3_REGION
+          EOF
+
+      - name: Create contents directory and sync from R2
+        run: |
+          mkdir -p contents
+          rclone --config rclone.conf sync r2:$S3_BUCKET contents/
+          ls contents
+
+      - name: Clone or create target GitHub repo
+        run: |
+          gh repo clone "$TARGET_REPO"
+
+      - name: Replace repo contents except .git
+        run: |
+          cd "$TARGET_REPO"
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          cp -r ../contents/* .
+
+      - name: Push all changes
+        run: |
+          cd "$TARGET_REPO"
+          git config user.name "Risang Baskoro"
+          git config user.email "contact@risangbaskoro.com"
+          git add .
+          git commit -m "$COMMIT_MESSAGE" || echo "Nothing to commit"
+          git branch -M main
+          git remote set-url origin https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/$TARGET_REPO.git
+          git push -u origin main
