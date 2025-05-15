@@ -19,8 +19,8 @@ jobs:
 
       - name: Commit and push reset timestamp
         run: |
-          git config user.name "${{ github.actor }}"
-          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          git config user.name "Risang Baskoro"
+          git config user.email "contact@risangbaskoro.com"
           git add last_reset.txt
           git commit -m "Reset via GitHub Actions" || echo "Nothing to commit"
           git push
